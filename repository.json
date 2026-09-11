@@ -1,0 +1,47 @@
+{
+  "id": "com.showrush.downloader-repo",
+  "name": "Showrush Official Downloader Repository",
+  "author": "Showrush Core Team",
+  "version": "1.0.0",
+  "description": "Dedicated repository for Showrush offline download extensions, segment stitchers, and background downloader workers.",
+  "plugins": [
+    {
+      "id": "com.showrush.downloader",
+      "name": "Showrush Stream & HLS Downloader",
+      "version": "1.0.0",
+      "author": "Showrush Core Team",
+      "description": "High-performance offline downloader for movies & TV episodes. Supports direct MP4/MKV downloads and multi-segment HLS (.m3u8) stream assembly with real-time speed & progress tracking.",
+      "category": "plugin",
+      "capabilities": [
+        "downloader"
+      ],
+      "types": [
+        "movie",
+        "tv",
+        "anime"
+      ],
+      "languages": [
+        "all"
+      ],
+      "settingsSchema": [
+        {
+          "key": "concurrency",
+          "label": "Concurrent Chunk Workers",
+          "type": "number",
+          "description": "Number of segments downloaded simultaneously (1-8)",
+          "default": 3
+        },
+        {
+          "key": "autoOpenOffline",
+          "label": "Auto-Prompt Save on Completion",
+          "type": "boolean",
+          "description": "Automatically trigger OS save dialog when download completes",
+          "default": true
+        }
+      ],
+      "scriptUrl": "https://raw.githubusercontent.com/muchandresh/showrush-downloader-plugin/refs/heads/master/src/plugins/showrush-downloader/index.js",
+      "manifestUrl": "https://raw.githubusercontent.com/muchandresh/showrush-downloader-plugin/refs/heads/master/src/plugins/showrush-downloader/manifest.json",
+      "pluginDir": "src/plugins/showrush-downloader"
+    }
+  ]
+}
