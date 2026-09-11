@@ -50,7 +50,7 @@ function triggerDownloadPrompt(blobUrl, filename) {
       try {
         document.body.removeChild(a);
       } catch (_) {}
-    }, 1000);
+    }, 2500);
   } catch (err) {
     console.warn('[Downloader] Browser save trigger notice:', err);
   }
@@ -71,7 +71,6 @@ return {
   },
 
   async getStreams() {
-    // Utility plugin: does not provide content streams
     return [];
   },
 
@@ -142,13 +141,26 @@ return {
     const headers = task.headers || {};
     let playlistUrl = task.streamUrl;
 
-    // Fetch initial playlist
-    const res = await Showrush.http.get(playlistUrl, { headers });
-    if (!res.ok || !res.data) {
-      throw new Error(`Failed to fetch master playlist (HTTP ${res.status})`);
+    onProgress({ speed: 'Fetching playlist...', progress: 1 });
+
+    // Fetch initial playlist (with timeout and retry)
+    let playlistText = '';
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        const res = await Showrush.http.get(playlistUrl, { headers, timeoutMs: 15000 });
+        if (res.ok && res.data) {
+          playlistText = res.data;
+          break;
+        }
+      } catch (e) {
+        if (attempt === 2) throw e;
+        await new Promise((r) => setTimeout(r, 1000));
+      }
     }
 
-    let playlistText = res.data;
+    if (!playlistText) {
+      throw new Error('Could not fetch HLS playlist. Stream may have expired or requires authentication.');
+    }
 
     // Check for Master Variant Playlist
     if (playlistText.includes('#EXT-X-STREAM-INF:')) {
@@ -161,31 +173,44 @@ return {
         if (line.startsWith('#EXT-X-STREAM-INF:')) {
           const bwMatch = line.match(/BANDWIDTH=(\d+)/);
           const bw = bwMatch ? parseInt(bwMatch[1], 10) : 0;
-          const nextUrl = (lines[i + 1] || '').trim();
-          if (nextUrl && !nextUrl.startsWith('#')) {
-            if (bw > highestBandwidth) {
-              highestBandwidth = bw;
-              targetVariantUrl = resolveUrl(nextUrl, playlistUrl);
+          
+          let nextUrl = '';
+          for (let j = i + 1; j < lines.length; j++) {
+            const candidate = (lines[j] || '').trim();
+            if (candidate && !candidate.startsWith('#')) {
+              nextUrl = candidate;
+              break;
             }
+          }
+
+          if (nextUrl && bw > highestBandwidth) {
+            highestBandwidth = bw;
+            targetVariantUrl = resolveUrl(nextUrl, playlistUrl);
           }
         }
       }
 
       if (targetVariantUrl) {
         playlistUrl = targetVariantUrl;
-        const variantRes = await Showrush.http.get(playlistUrl, { headers });
+        const variantRes = await Showrush.http.get(playlistUrl, { headers, timeoutMs: 15000 });
         if (variantRes.ok && variantRes.data) {
           playlistText = variantRes.data;
         }
       }
     }
 
-    // Parse Media Playlist Segments
+    // Parse Media Playlist Segments & Map
+    let initSegmentUrl = null;
     const segmentUrls = [];
     const lines = playlistText.split('\n');
     for (let i = 0; i < lines.length; i++) {
       const line = lines[i].trim();
-      if (line && !line.startsWith('#')) {
+      if (line.startsWith('#EXT-X-MAP:')) {
+        const uriMatch = line.match(/URI="([^"]+)"/);
+        if (uriMatch) {
+          initSegmentUrl = resolveUrl(uriMatch[1], playlistUrl);
+        }
+      } else if (line && !line.startsWith('#')) {
         segmentUrls.push(resolveUrl(line, playlistUrl));
       }
     }
@@ -195,11 +220,16 @@ return {
       throw new Error('Playlist contains no media segments');
     }
 
-    console.log(`[Downloader] Found ${totalSegments} segments for ${task.title}`);
+    // If init segment exists, prepend it
+    if (initSegmentUrl) {
+      segmentUrls.unshift(initSegmentUrl);
+    }
+
+    console.log(`[Downloader] Downloading ${segmentUrls.length} chunks for ${task.title}`);
 
     // Concurrency Worker Queue
-    const concurrency = Math.max(1, Math.min(8, this.settings?.concurrency || 3));
-    const segmentBuffers = new Array(totalSegments);
+    const concurrency = Math.max(1, Math.min(6, this.settings?.concurrency || 3));
+    const segmentBuffers = new Array(segmentUrls.length);
     let completedCount = 0;
     let accumulatedBytes = 0;
     let lastBytes = 0;
@@ -209,7 +239,7 @@ return {
     const updateSpeed = () => {
       const now = Date.now();
       const elapsed = (now - lastTime) / 1000;
-      if (elapsed >= 1.0) {
+      if (elapsed >= 0.8) {
         const bytesDiff = accumulatedBytes - lastBytes;
         speedStr = formatSpeed(bytesDiff / elapsed);
         lastBytes = accumulatedBytes;
@@ -219,7 +249,7 @@ return {
 
     let nextIndex = 0;
     const worker = async () => {
-      while (nextIndex < totalSegments) {
+      while (nextIndex < segmentUrls.length) {
         if (taskState.cancelled) return;
         while (taskState.paused) {
           await new Promise((r) => setTimeout(r, 500));
@@ -229,13 +259,14 @@ return {
         const idx = nextIndex++;
         const segUrl = segmentUrls[idx];
 
-        // Fetch segment with retry
+        // Fetch segment with up to 3 retries
         let buffer = null;
         for (let attempt = 0; attempt < 3; attempt++) {
           try {
             const segRes = await Showrush.http.get(segUrl, {
               headers,
-              responseType: 'arraybuffer'
+              responseType: 'arraybuffer',
+              timeoutMs: 25000
             });
             if (segRes.ok && segRes.arrayBuffer && segRes.arrayBuffer.byteLength > 0) {
               buffer = segRes.arrayBuffer;
@@ -243,7 +274,7 @@ return {
             }
           } catch (e) {
             if (attempt === 2) throw e;
-            await new Promise((r) => setTimeout(r, 800));
+            await new Promise((r) => setTimeout(r, 600));
           }
         }
 
@@ -256,8 +287,8 @@ return {
         accumulatedBytes += buffer.byteLength;
         updateSpeed();
 
-        const progressPercent = Math.min(99, Math.round((completedCount / totalSegments) * 100));
-        const estimatedTotal = Math.round((accumulatedBytes / completedCount) * totalSegments);
+        const progressPercent = Math.min(99, Math.round((completedCount / segmentUrls.length) * 100));
+        const estimatedTotal = Math.round((accumulatedBytes / completedCount) * segmentUrls.length);
 
         onProgress({
           status: 'downloading',
@@ -280,20 +311,10 @@ return {
       throw new Error('Download cancelled');
     }
 
-    // Stitch segments together into continuous MPEG-TS / MP4 binary
-    onProgress({ speed: 'Assembling file...', progress: 99 });
-    const totalByteLength = segmentBuffers.reduce((sum, buf) => sum + (buf ? buf.byteLength : 0), 0);
-    const mergedUint8 = new Uint8Array(totalByteLength);
-    let byteOffset = 0;
-    for (const buf of segmentBuffers) {
-      if (buf) {
-        mergedUint8.set(new Uint8Array(buf), byteOffset);
-        byteOffset += buf.byteLength;
-      }
-    }
-
-    // Create playable Blob
-    const blob = new Blob([mergedUint8], { type: 'video/mp2t' });
+    // Assemble file as Blob without giant contiguous array buffer
+    onProgress({ speed: 'Saving to device...', progress: 99 });
+    const validBuffers = segmentBuffers.filter(Boolean);
+    const blob = new Blob(validBuffers, { type: 'video/mp4' });
     const localBlobUrl = URL.createObjectURL(blob);
 
     // Trigger save to local storage/downloads folder
@@ -304,8 +325,8 @@ return {
     onProgress({
       status: 'completed',
       progress: 100,
-      downloadedBytes: totalByteLength,
-      totalBytes: totalByteLength,
+      downloadedBytes: accumulatedBytes,
+      totalBytes: accumulatedBytes,
       speed: '',
       localFilePath: localBlobUrl
     });
@@ -318,9 +339,12 @@ return {
    */
   async downloadDirectStream(task, taskState, onProgress, filename) {
     const headers = task.headers || {};
+    onProgress({ speed: 'Downloading file...', progress: 10 });
+
     const res = await Showrush.http.get(task.streamUrl, {
       headers,
-      responseType: 'arraybuffer'
+      responseType: 'arraybuffer',
+      timeoutMs: 60000
     });
 
     if (!res.ok || !res.arrayBuffer) {
