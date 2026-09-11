@@ -12,6 +12,6 @@ Official standalone downloader repository for the **Showrush** streaming ecosyst
 ## 📦 How to Use in Showrush
 Add this repository manifest URL in **Showrush Settings > Extensions > Add Repository**:
 ```
-https://raw.githubusercontent.com/muchandresh/showrush-downloader-plugin/refs/heads/master/repository.json
+https://raw.githubusercontent.com/muchandresh/showrush-downloader-plugin/refs/heads/master/repository.json?token=GHSAT0AAAAAAEGVKPSV54PYAAYQCCCQ5AUQ2VDKSJQ
 ```
 Or install directly from the local bundle.
