@@ -199,13 +199,36 @@ return {
       }
     }
 
-    // Parse Media Playlist Segments & Map
+    // Parse Media Playlist Segments, Sequences & Encryption Keys
     let initSegmentUrl = null;
+    let keyInfo = null; // { method, keyUrl, ivHex, cryptoKey }
+    let mediaSequence = 0;
     const segmentUrls = [];
     const lines = playlistText.split('\n');
+
     for (let i = 0; i < lines.length; i++) {
       const line = lines[i].trim();
-      if (line.startsWith('#EXT-X-MAP:')) {
+      if (line.startsWith('#EXT-X-MEDIA-SEQUENCE:')) {
+        const seqMatch = line.match(/#EXT-X-MEDIA-SEQUENCE:(\d+)/);
+        if (seqMatch) mediaSequence = parseInt(seqMatch[1], 10);
+      } else if (line.startsWith('#EXT-X-KEY:')) {
+        const methodMatch = line.match(/METHOD=([^,\s]+)/);
+        const method = methodMatch ? methodMatch[1] : '';
+        if (method === 'AES-128') {
+          const uriMatch = line.match(/URI="([^"]+)"/);
+          const ivMatch = line.match(/IV=0x([0-9a-fA-F]+)/);
+          if (uriMatch) {
+            keyInfo = {
+              method: 'AES-128',
+              keyUrl: resolveUrl(uriMatch[1], playlistUrl),
+              ivHex: ivMatch ? ivMatch[1] : null,
+              cryptoKey: null,
+            };
+          }
+        } else if (method === 'NONE') {
+          keyInfo = null;
+        }
+      } else if (line.startsWith('#EXT-X-MAP:')) {
         const uriMatch = line.match(/URI="([^"]+)"/);
         if (uriMatch) {
           initSegmentUrl = resolveUrl(uriMatch[1], playlistUrl);
@@ -223,6 +246,30 @@ return {
     // If init segment exists, prepend it
     if (initSegmentUrl) {
       segmentUrls.unshift(initSegmentUrl);
+    }
+
+    // If stream is AES-128 encrypted, fetch decryption key
+    if (keyInfo && keyInfo.keyUrl) {
+      onProgress({ speed: 'Fetching decryption key...', progress: 2 });
+      try {
+        const keyRes = await Showrush.http.get(keyInfo.keyUrl, {
+          headers,
+          responseType: 'arraybuffer',
+          timeoutMs: 15000
+        });
+        if (keyRes.ok && keyRes.arrayBuffer && typeof crypto !== 'undefined' && crypto.subtle) {
+          keyInfo.cryptoKey = await crypto.subtle.importKey(
+            'raw',
+            keyRes.arrayBuffer,
+            { name: 'AES-CBC' },
+            false,
+            ['decrypt']
+          );
+          console.log('[Downloader] Decryption key loaded successfully for AES-128');
+        }
+      } catch (keyErr) {
+        console.warn('[Downloader] Failed to fetch decryption key:', keyErr);
+      }
     }
 
     console.log(`[Downloader] Downloading ${segmentUrls.length} chunks for ${task.title}`);
@@ -282,6 +329,27 @@ return {
           throw new Error(`Failed to download segment #${idx + 1}`);
         }
 
+        // Decrypt AES-128 segment if key is available
+        if (keyInfo && keyInfo.cryptoKey && typeof crypto !== 'undefined' && crypto.subtle) {
+          try {
+            let ivBytes;
+            if (keyInfo.ivHex) {
+              const hex = keyInfo.ivHex.padStart(32, '0');
+              ivBytes = new Uint8Array(16);
+              for (let b = 0; b < 16; b++) {
+                ivBytes[b] = parseInt(hex.substr(b * 2, 2), 16);
+              }
+            } else {
+              ivBytes = new Uint8Array(16);
+              const seq = mediaSequence + (initSegmentUrl ? Math.max(0, idx - 1) : idx);
+              new DataView(ivBytes.buffer).setUint32(12, seq);
+            }
+            buffer = await crypto.subtle.decrypt({ name: 'AES-CBC', iv: ivBytes }, keyInfo.cryptoKey, buffer);
+          } catch (decErr) {
+            console.warn(`[Downloader] Decryption notice for segment #${idx}:`, decErr);
+          }
+        }
+
         segmentBuffers[idx] = buffer;
         completedCount++;
         accumulatedBytes += buffer.byteLength;
@@ -311,15 +379,79 @@ return {
       throw new Error('Download cancelled');
     }
 
-    // Assemble file as Blob without giant contiguous array buffer
-    onProgress({ speed: 'Saving to device...', progress: 99 });
+    // Assemble file as Blob with transmuxing
+    onProgress({ speed: 'Packaging media...', progress: 99 });
     const validBuffers = segmentBuffers.filter(Boolean);
-    const blob = new Blob(validBuffers, { type: 'video/mp4' });
-    const localBlobUrl = URL.createObjectURL(blob);
+    if (validBuffers.length === 0) {
+      throw new Error('No media segments could be downloaded');
+    }
+
+    const isMpegTs = (buf) => {
+      if (!buf || buf.byteLength < 188) return false;
+      const v = new Uint8Array(buf, 0, Math.min(buf.byteLength, 188 * 3));
+      return v[0] === 0x47 && (v.length < 188 || v[188] === 0x47);
+    };
+
+    let finalBlob = null;
+    let finalExt = 'mp4';
+
+    if (isMpegTs(validBuffers[0])) {
+      let transmuxed = false;
+      if (Showrush.media && typeof Showrush.media.transmuxTsToMp4 === 'function') {
+        try {
+          onProgress({ speed: 'Transmuxing MPEG-TS to MP4 (no quality loss)...', progress: 99 });
+          const res = await Showrush.media.transmuxTsToMp4(validBuffers);
+          if (res && res.blob) {
+            finalBlob = res.blob;
+            finalExt = res.format || 'mp4';
+            transmuxed = true;
+          }
+        } catch (mErr) {
+          console.warn('[Downloader] Showrush.media.transmuxTsToMp4 notice:', mErr);
+        }
+      }
+
+      if (!transmuxed && typeof muxjs !== 'undefined' && muxjs.mp4 && muxjs.mp4.Transmuxer) {
+        try {
+          onProgress({ speed: 'Remuxing TS to MP4...', progress: 99 });
+          const transmuxer = new muxjs.mp4.Transmuxer({ remux: true });
+          let initSegment = null;
+          const mp4Parts = [];
+          transmuxer.on('data', (seg) => {
+            if (seg.initSegment && !initSegment) initSegment = seg.initSegment;
+            if (seg.data) mp4Parts.push(seg.data);
+          });
+          for (const b of validBuffers) {
+            transmuxer.push(new Uint8Array(b));
+            transmuxer.flush();
+          }
+          if (initSegment && mp4Parts.length > 0) {
+            finalBlob = new Blob([initSegment, ...mp4Parts], { type: 'video/mp4' });
+            finalExt = 'mp4';
+            transmuxed = true;
+          }
+        } catch (tErr) {
+          console.warn('[Downloader] Internal muxjs fallback notice:', tErr);
+        }
+      }
+
+      if (!transmuxed) {
+        // Fallback: save as genuine .ts so media players activate TS demuxer rather than failing on MP4
+        finalBlob = new Blob(validBuffers, { type: 'video/mp2t' });
+        finalExt = 'ts';
+      }
+    } else {
+      // Already fMP4 or direct MP4 chunks (e.g. #EXT-X-MAP:URI)
+      finalBlob = new Blob(validBuffers, { type: 'video/mp4' });
+      finalExt = 'mp4';
+    }
+
+    const outFilename = filename.replace(/\.(mp4|ts|mkv)$/i, '') + `.${finalExt}`;
+    const localBlobUrl = URL.createObjectURL(finalBlob);
 
     // Trigger save to local storage/downloads folder
     if (this.settings?.autoOpenOffline !== false) {
-      triggerDownloadPrompt(localBlobUrl, filename);
+      triggerDownloadPrompt(localBlobUrl, outFilename);
     }
 
     onProgress({
